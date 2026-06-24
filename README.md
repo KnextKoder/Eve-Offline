@@ -1,0 +1,1 @@
+An offline first desktop app that builds ontop of vercel's eve agent framework to create, manage and update locally run agents.
