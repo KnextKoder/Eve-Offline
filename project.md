@@ -93,7 +93,7 @@ eve offline/
 ```
 POST /agents/base/run
       ↓
-Elysia sidecar (port 3799)
+Elysia sidecar (dynamic OS-assigned port)
       ↓  reads
 agents/base/agent/instructions.md → system prompt
       ↓  POST /v1/chat/completions
@@ -109,7 +109,7 @@ Response: "I am Eve, an offline AI assistant running locally on your machine."
 
 ### ✅ Config system
 - `eve.config.json` stored at `%APPDATA%\eve-offline\eve.config.json`
-- Shape: `{ "modelPath": "...", "port": 3799 }`
+- Shape: `{ "modelPath": "..." }` — `port` field is now ignored (OS assigns port dynamically)
 - Read on sidecar startup; exposed via `GET /config` and `POST /config`
 - **Critical:** must be written without BOM — use `[System.IO.File]::WriteAllText()` not PowerShell `-Encoding utf8`
 
@@ -121,6 +121,15 @@ Response: "I am Eve, an offline AI assistant running locally on your machine."
 - Sidecar stdout/stderr piped to Rust console via `CommandEvent`
 - Sidecar killed cleanly on window close
 - No compiled sidecar binary needed — eliminates the `@libsql/client` WASM crash
+
+### ✅ Dynamic port + health-checked splash screen
+- Elysia listens on port `0` — OS assigns a free port
+- Sidecar prints `EVE_PORT=<port>` to stdout; Rust parses it and emits `sidecar-ready` Tauri event
+- `SidecarPort` state stored in Rust, readable via `get_sidecar_port` command (race-condition safety)
+- React `App.tsx` shows a premium dark animated splash screen on launch
+- Splash polls `GET /health` every 250ms until `{ status: "ok", modelLoaded: true }` is returned
+- Window fades from splash → main workspace automatically once backend is ready
+- Dynamic port shown in the main workspace UI header
 
 ---
 
@@ -300,8 +309,11 @@ The Workflow SDK (`workflow` + `@workflow-worlds/turso`) was crashing in compile
 - **`cargo check` while app is running** fails with `Access is denied` on `bun.exe` because the running sidecar holds a lock on it. Stop the app first.
 - **PowerShell `cargo check 2>&1` exits 1** even on success — cargo writes `Checking ...` progress to stderr, which PowerShell treats as an error stream. The actual result is in the `Finished` line.
 - **`tauri-plugin-shell` sidecar stdout** is delivered via `CommandEvent::Stdout(line)` / `CommandEvent::Stderr(line)` on the `Receiver` returned by `.spawn()`. Pipe in a `tauri::async_runtime::spawn` task.
-- **Dev vs prod path resolution** — in dev, `resource_dir()` points to `src-tauri/`. Navigate up from `current_exe()` (3 parents) to reach the project root. Use `#[cfg(debug_assertions)]` to switch. Pass the resolved root as `EVE_RESOURCE_DIR` env var to bun.
+- **Dev vs prod path resolution** — in dev, `resource_dir()` points to `src-tauri/`. Navigate up from `current_exe()` (4 parents) to reach the project root. Use `#[cfg(debug_assertions)]` to switch. Pass the resolved root as `EVE_RESOURCE_DIR` env var to bun.
 - **Rust borrow checker (E0597)** — `window.state::<T>()` returns a `State<'_, T>` that borrows `window`. Don't bind it to a named variable; inline the call so the temporary drops at the statement's semicolon.
+- **Dynamic port protocol** — Elysia calls `.listen(0)` then reads `app.server!.port`. The sidecar prints `EVE_PORT=<port>` to stdout. Rust parses this in the `CommandEvent::Stdout` handler; once parsed it emits `sidecar-ready` to the frontend and stores the port in `SidecarPort` state. The frontend also calls `get_sidecar_port` command immediately after subscribing to handle race conditions where the event fires before the listener is registered.
+- **Tauri `use tauri::Emitter`** — must be imported explicitly for `app_handle.emit()` to be in scope in Tauri v2. Without it the compiler gives a confusing "method not found" error.
+- **React health poll + event race** — subscribe to `listen('sidecar-ready')` *before* calling `invoke('get_sidecar_port')` so the port is never missed if Rust emits between the two calls.
 
 ### Eve agent structure
 - Eve init fails on Windows with "Project name can only contain..." when run from a directory with spaces. Run from a clean path.
@@ -324,8 +336,8 @@ The Workflow SDK (`workflow` + `@workflow-worlds/turso`) was crashing in compile
 - [x] Spawn sidecar from Rust on app launch (`src-tauri/src/lib.rs`)
 - [x] Pipe sidecar stdout/stderr to Rust console via `CommandEvent`
 - [x] Kill sidecar on window close
-- [ ] Health check before showing UI — hold splash until port 3799 responds
-- [ ] Dynamic port via Tauri events (currently hardcoded 3799)
+- [x] Health check before showing UI — animated splash held until `/health` responds 200
+- [x] Dynamic port via Tauri events — Elysia uses port `0`, Rust parses `EVE_PORT=` from stdout and emits `sidecar-ready` event
 
 ### Phase 3 — UI
 - [ ] Model file picker (Tauri `dialog` plugin → `.gguf` filter)

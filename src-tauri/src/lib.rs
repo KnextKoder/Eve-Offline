@@ -1,14 +1,23 @@
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use std::sync::Mutex;
 
 struct SidecarState(Mutex<Option<CommandChild>>);
+struct SidecarPort(Mutex<Option<u16>>);
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+/// Returns the port the sidecar is listening on, or None if not yet ready.
+/// The frontend calls this to handle the case where the `sidecar-ready` event
+/// was emitted before the listener was registered.
+#[tauri::command]
+fn get_sidecar_port(state: tauri::State<SidecarPort>) -> Option<u16> {
+    *state.0.lock().unwrap()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -17,9 +26,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .manage(SidecarState(Mutex::new(None)))
+        .manage(SidecarPort(Mutex::new(None)))
         .setup(|app| {
             // In dev, the exe lives at src-tauri/target/debug/eve-offline.exe
-            // Navigate up 3 levels (debug → target → src-tauri) to reach the project root.
+            // Navigate up 4 levels (debug → target → src-tauri → project root).
             // In release, resources are bundled by Tauri into resource_dir which already
             // contains the sidecar/ directory.
             #[cfg(debug_assertions)]
@@ -50,12 +60,29 @@ pub fn run() {
                 .spawn()
                 .expect("failed to spawn bun sidecar");
 
-            // Pipe sidecar stdout/stderr into the Rust console
+            // Pipe sidecar stdout/stderr into the Rust console.
+            // Also parse `EVE_PORT=<port>` line to emit a Tauri event to the frontend.
+            let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 while let Some(event) = rx.recv().await {
                     match event {
                         CommandEvent::Stdout(line) => {
-                            print!("[sidecar] {}", String::from_utf8_lossy(&line));
+                            let text = String::from_utf8_lossy(&line);
+                            print!("[sidecar] {}", text);
+
+                            // Parse dynamic port emitted by sidecar
+                            let trimmed = text.trim();
+                            if let Some(port_str) = trimmed.strip_prefix("EVE_PORT=") {
+                                if let Ok(port) = port_str.trim().parse::<u16>() {
+                                    println!("[tauri] Sidecar port resolved: {}", port);
+                                    // Store in state for command-based retrieval
+                                    *app_handle.state::<SidecarPort>().0.lock().unwrap() = Some(port);
+                                    // Emit event to frontend
+                                    if let Err(e) = app_handle.emit("sidecar-ready", port) {
+                                        eprintln!("[tauri] Failed to emit sidecar-ready: {}", e);
+                                    }
+                                }
+                            }
                         }
                         CommandEvent::Stderr(line) => {
                             eprint!("[sidecar] {}", String::from_utf8_lossy(&line));
@@ -79,7 +106,7 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![greet, get_sidecar_port])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -1,25 +1,205 @@
-import { useState, useEffect } from "react";
-import reactLogo from "./assets/react.svg";
+import { useState, useEffect, useCallback } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
-import { Layers, Radio, Send, Clock, Compass, Activity } from "lucide-react";
+import { Layers, Radio, Send, Clock, Compass, Activity, Cpu, Server, CheckCircle2, Loader2 } from "lucide-react";
 import "./App.css";
 
+// --- Splash Screen Loading UI ---
+type LoadingStep = {
+  id: string;
+  label: string;
+  done: boolean;
+  active: boolean;
+};
+
+function SplashScreen({ steps, statusText }: { steps: LoadingStep[]; statusText: string }) {
+  return (
+    <div
+      id="splash-screen"
+      className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-slate-950 overflow-hidden"
+    >
+      {/* Ambient background glows */}
+      <div className="absolute top-[-20%] left-[-20%] w-[70%] h-[70%] rounded-full bg-indigo-900/15 blur-[140px] pointer-events-none animate-pulse" />
+      <div className="absolute bottom-[-20%] right-[-20%] w-[70%] h-[70%] rounded-full bg-violet-900/10 blur-[140px] pointer-events-none" />
+
+      {/* Main card */}
+      <div className="relative w-full max-w-sm mx-auto bg-slate-900/50 backdrop-blur-2xl border border-slate-800/80 rounded-2xl shadow-2xl p-8 flex flex-col gap-8">
+
+        {/* Logo / Brand */}
+        <div className="flex flex-col items-center gap-3">
+          <div className="relative">
+            <div className="w-16 h-16 rounded-2xl bg-linear-to-br from-indigo-500 to-violet-600 flex items-center justify-center shadow-[0_0_30px_rgba(99,102,241,0.5)]">
+              <Cpu className="w-8 h-8 text-white" />
+            </div>
+            <div className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-emerald-500 border-2 border-slate-950 animate-pulse" />
+          </div>
+          <div className="text-center">
+            <h1 className="text-2xl font-extrabold tracking-tight bg-linear-to-r from-white via-slate-100 to-slate-400 bg-clip-text text-transparent">
+              Eve Offline
+            </h1>
+            <p className="text-xs text-slate-500 mt-1 font-mono tracking-wider">INITIALIZING RUNTIME</p>
+          </div>
+        </div>
+
+        {/* Step checklist */}
+        <div className="flex flex-col gap-3">
+          {steps.map((step) => (
+            <div
+              key={step.id}
+              className={`flex items-center gap-3 py-2.5 px-3 rounded-xl transition-all duration-500 ${
+                step.active && !step.done
+                  ? "bg-indigo-500/10 border border-indigo-500/20"
+                  : step.done
+                  ? "opacity-70"
+                  : "opacity-40"
+              }`}
+            >
+              <div className="w-5 h-5 shrink-0 flex items-center justify-center">
+                {step.done ? (
+                  <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                ) : step.active ? (
+                  <Loader2 className="w-5 h-5 text-indigo-400 animate-spin" />
+                ) : (
+                  <div className="w-2 h-2 rounded-full bg-slate-600" />
+                )}
+              </div>
+              <span className={`text-sm font-mono ${step.done ? "text-slate-400" : step.active ? "text-slate-200" : "text-slate-600"}`}>
+                {step.label}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {/* Status text */}
+        <div className="text-center">
+          <p className="text-xs font-mono text-slate-500 tracking-wider min-h-4">
+            {statusText}
+          </p>
+          {/* Scanning bar */}
+          <div className="mt-3 h-0.5 w-full bg-slate-800 rounded-full overflow-hidden">
+            <div className="h-full bg-linear-to-r from-indigo-500 to-violet-500 rounded-full origin-left animate-[shimmer_2s_ease-in-out_infinite]" />
+          </div>
+        </div>
+      </div>
+
+      <p className="mt-6 text-[10px] font-mono text-slate-700 tracking-widest">EVE OFFLINE v0.1.0</p>
+    </div>
+  );
+}
+
+// --- Main App ---
+const STEPS_INIT: LoadingStep[] = [
+  { id: "runtime", label: "Starting agent runtime", done: false, active: true },
+  { id: "port", label: "Allocating sidecar port", done: false, active: false },
+  { id: "health", label: "Waiting for health check", done: false, active: false },
+  { id: "llm", label: "Loading LLM model", done: false, active: false },
+];
+
 function App() {
+  const [steps, setSteps] = useState<LoadingStep[]>(STEPS_INIT);
+  const [statusText, setStatusText] = useState("Initializing Eve runtime…");
+  const [healthOk, setHealthOk] = useState(false);
+  const [sidecarPort, setSidecarPort] = useState<number | null>(null);
+  const [exiting, setExiting] = useState(false);
+
+  // Clock for the main workspace
+  const [time, setTime] = useState(new Date());
   const [greetMsg, setGreetMsg] = useState("");
   const [name, setName] = useState("");
-  const [time, setTime] = useState(new Date());
 
   useEffect(() => {
     const timer = setInterval(() => setTime(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
 
+  const markStep = useCallback((id: string, done: boolean, nextId?: string) => {
+    setSteps((prev) =>
+      prev.map((s) => {
+        if (s.id === id) return { ...s, done, active: !done };
+        if (nextId && s.id === nextId) return { ...s, active: true };
+        return s;
+      })
+    );
+  }, []);
+
+  // Health poll loop
+  const pollHealth = useCallback(async (port: number) => {
+    markStep("port", true, "health");
+    setStatusText(`Sidecar on :${port} — waiting for health check…`);
+    let attempts = 0;
+    while (true) {
+      try {
+        const res = await fetch(`http://localhost:${port}/health`);
+        if (res.ok) {
+          const data = await res.json() as { status: string; modelLoaded: boolean };
+          markStep("health", true, "llm");
+          setStatusText("Health OK — loading LLM model…");
+          if (data.modelLoaded) {
+            markStep("llm", true);
+            setStatusText("All systems ready!");
+            await new Promise((r) => setTimeout(r, 600));
+            setExiting(true);
+            await new Promise((r) => setTimeout(r, 400));
+            setHealthOk(true);
+            return;
+          }
+          // modelLoaded is false — still loading. Keep polling.
+          setStatusText(`LLM model loading… (check ${attempts})`);
+        }
+      } catch {
+        // sidecar not yet accepting connections
+      }
+      attempts++;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }, [markStep]);
+
+  // On mount: listen for sidecar-ready event, also check if already emitted
+  useEffect(() => {
+    let cancelled = false;
+
+    const setup = async () => {
+      markStep("runtime", false, "port");
+      setStatusText("Connecting to sidecar…");
+
+      // Subscribe first to avoid race
+      const unlisten = await listen<number>("sidecar-ready", async (event) => {
+        if (cancelled) return;
+        const port = event.payload;
+        setSidecarPort(port);
+        await pollHealth(port);
+        unlisten();
+      });
+
+      // Check if the event already fired before we subscribed
+      const existingPort = await invoke<number | null>("get_sidecar_port");
+      if (existingPort !== null && existingPort !== undefined && !cancelled) {
+        setSidecarPort(existingPort);
+        unlisten(); // don't double-fire
+        await pollHealth(existingPort);
+      }
+    };
+
+    setup().catch(console.error);
+    return () => { cancelled = true; };
+  }, [pollHealth, markStep]);
+
   async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
     setGreetMsg(await invoke("greet", { name }));
   }
 
+  if (!healthOk) {
+    return (
+      <div className={`transition-opacity duration-400 ${exiting ? "opacity-0" : "opacity-100"}`}>
+        <SplashScreen steps={steps} statusText={statusText} />
+      </div>
+    );
+  }
+
+  // ----------------------------------------------------------------
+  // MAIN WORKSPACE — shown after health check passes
+  // ----------------------------------------------------------------
   return (
     <div className="dark min-h-screen bg-slate-950 text-slate-100 font-sans antialiased relative overflow-hidden flex flex-col items-center justify-center p-4 md:p-8 bg-grid-pattern selection:bg-indigo-500/30">
       {/* Background ambient glow points */}
@@ -28,24 +208,24 @@ function App() {
 
       {/* Main glassmorphic panel */}
       <main className="w-full max-w-4xl bg-slate-900/40 backdrop-blur-xl border border-slate-800/80 rounded-2xl shadow-2xl overflow-hidden grid grid-cols-1 md:grid-cols-12 divide-y md:divide-y-0 md:divide-x divide-slate-800/80 z-10">
-        
+
         {/* Left Side: Greet Control Panel (Spans 7 columns) */}
         <section className="col-span-12 md:col-span-7 p-6 md:p-8 flex flex-col justify-between space-y-8">
           <div>
             <div className="flex items-center gap-2 mb-3">
               <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono font-medium tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                SYSTEM SECURE
+                SYSTEM ONLINE
               </span>
               <span className="text-[10px] font-mono tracking-wider text-slate-500">
-                PORT-COMMS: 1420
+                SIDECAR: :{sidecarPort ?? "—"}
               </span>
             </div>
             <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight bg-linear-to-r from-white via-slate-100 to-slate-400 bg-clip-text text-transparent">
-              Welcome to Tauri
+              Welcome to Eve
             </h1>
             <p className="text-sm text-slate-400 mt-2 leading-relaxed">
-              Bridging high-performance Rust backends with web-tier React frontend environments. Input your identity to verify Tauri interop.
+              Offline AI agents running locally on your machine. Input your identity to verify Tauri interop.
             </p>
           </div>
 
@@ -117,7 +297,7 @@ function App() {
 
         {/* Right Side: Stack & Status Telemetry (Spans 5 columns) */}
         <section className="col-span-12 md:col-span-5 p-6 md:p-8 bg-slate-900/10 flex flex-col justify-between space-y-8">
-          
+
           {/* Core Modules Grid */}
           <div className="space-y-6">
             <div className="border-b border-slate-800/60 pb-3">
@@ -128,18 +308,13 @@ function App() {
             </div>
 
             <div className="grid grid-cols-3 gap-3">
-              {/* Vite Core */}
-              <a
-                href="https://vite.dev"
-                target="_blank"
-                rel="noreferrer"
-                className="group flex flex-col items-center justify-center p-3 rounded-xl border border-slate-800/80 bg-slate-950/40 hover:bg-slate-950/80 hover:border-yellow-500/30 hover:shadow-[0_0_15px_rgba(234,179,8,0.1)] transition-all duration-300"
-              >
+              {/* Eve Core */}
+              <div className="group flex flex-col items-center justify-center p-3 rounded-xl border border-slate-800/80 bg-slate-950/40">
                 <div className="relative w-10 h-10 flex items-center justify-center">
-                  <img src="/vite.svg" className="w-8 h-8 object-contain group-hover:scale-115 transition-transform duration-300 animate-float" alt="Vite logo" />
+                  <Cpu className="w-7 h-7 text-indigo-400" />
                 </div>
-                <span className="text-[10px] font-mono mt-2 text-slate-400 group-hover:text-yellow-400 transition-colors">Vite</span>
-              </a>
+                <span className="text-[10px] font-mono mt-2 text-slate-400">Eve</span>
+              </div>
 
               {/* Tauri Core */}
               <a
@@ -149,26 +324,21 @@ function App() {
                 className="group flex flex-col items-center justify-center p-3 rounded-xl border border-slate-800/80 bg-slate-950/40 hover:bg-slate-950/80 hover:border-sky-500/30 hover:shadow-[0_0_15px_rgba(14,165,233,0.1)] transition-all duration-300"
               >
                 <div className="relative w-10 h-10 flex items-center justify-center">
-                  <img src="/tauri.svg" className="w-8 h-8 object-contain group-hover:scale-115 transition-transform duration-300" alt="Tauri logo" />
+                  <img src="/tauri.svg" className="w-8 h-8 object-contain group-hover:scale-110 transition-transform duration-300" alt="Tauri logo" />
                 </div>
                 <span className="text-[10px] font-mono mt-2 text-slate-400 group-hover:text-sky-400 transition-colors">Tauri</span>
               </a>
 
-              {/* React Core */}
-              <a
-                href="https://react.dev"
-                target="_blank"
-                rel="noreferrer"
-                className="group flex flex-col items-center justify-center p-3 rounded-xl border border-slate-800/80 bg-slate-950/40 hover:bg-slate-950/80 hover:border-cyan-500/30 hover:shadow-[0_0_15px_rgba(6,182,212,0.1)] transition-all duration-300"
-              >
+              {/* Sidecar */}
+              <div className="group flex flex-col items-center justify-center p-3 rounded-xl border border-emerald-800/40 bg-emerald-950/10">
                 <div className="relative w-10 h-10 flex items-center justify-center">
-                  <img src={reactLogo} className="w-8 h-8 object-contain group-hover:rotate-180 group-hover:scale-115 transition-transform duration-700" alt="React logo" />
+                  <Server className="w-7 h-7 text-emerald-400" />
                 </div>
-                <span className="text-[10px] font-mono mt-2 text-slate-400 group-hover:text-cyan-400 transition-colors">React</span>
-              </a>
+                <span className="text-[10px] font-mono mt-2 text-emerald-400">Elysia</span>
+              </div>
             </div>
             <p className="text-[10px] text-slate-500 leading-normal text-center font-mono">
-              Hover over core nodes to initiate orbital telemetry links.
+              All modules initialized and communicating.
             </p>
           </div>
 
@@ -214,10 +384,10 @@ function App() {
                   </div>
                 </div>
                 <div className="p-2 rounded-lg border border-slate-800/50 bg-slate-950/30 space-y-1">
-                  <div className="text-[9px] text-slate-500">COMMS STATUS</div>
-                  <div className="font-semibold text-sky-400 flex items-center gap-1">
-                    <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
-                    SECURE
+                  <div className="text-[9px] text-slate-500">SIDECAR PORT</div>
+                  <div className="font-semibold text-emerald-400 flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    :{sidecarPort ?? "—"}
                   </div>
                 </div>
               </div>
@@ -230,4 +400,3 @@ function App() {
 }
 
 export default App;
-

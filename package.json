@@ -9,9 +9,12 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tdev": "bun tauri dev",
+    "tclean": "powershell -NoProfile -Command \"Get-Process -Name 'eve-offline','llama-server','bun-x86_64-pc-windows-msvc' -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host 'Processes cleared.'\"",
+    "tstart": "bun run tclean && bun tdev",
     "sidecar": "bun run sidecar/index.ts"
   },
   "dependencies": {
+    "@elysiajs/cors": "^1.4.2",
     "@fontsource-variable/inter": "^5.2.8",
     "@libsql/client": "^0.17.4",
     "@tauri-apps/api": "^2",

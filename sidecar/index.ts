@@ -2,6 +2,7 @@ import { createWorld } from "@workflow-worlds/turso";
 createWorld({ databaseUrl: "file:eve-offline.db" });
 
 import { Elysia } from "elysia";
+import { cors } from "@elysiajs/cors";
 import { spawn, type ChildProcess } from "child_process";
 import path from "path";
 import fs from "fs/promises";
@@ -141,6 +142,7 @@ async function callLlama(systemPrompt: string, message: string) {
 await startLlamaServer();
 
 const app = new Elysia()
+  .use(cors())
   .get("/health", () => ({ status: "ok", modelLoaded: !!config.modelPath }))
   .get("/config", async () => await loadConfig())
   .post("/config", async ({ body }: { body: any }) => {
@@ -151,9 +153,11 @@ const app = new Elysia()
     const response = await runAgent(params.name, body.message);
     return { response };
   })
-  .listen(config.port);
+  .listen(0);
 
-console.log(`Eve sidecar running on port ${app.server?.port}`);
+const EVE_PORT = app.server!.port;
+console.log(`EVE_PORT=${EVE_PORT}`);
+console.log(`Eve sidecar running on port ${EVE_PORT}`);
 
 // Cleanup on exit
 process.on("exit", () => llamaProcess?.kill());
